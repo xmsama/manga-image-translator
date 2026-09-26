@@ -1,3 +1,5 @@
+> **本 fork 新增**：[`workflow/`](workflow/README.md) —— 带图形界面的漫画翻译工具：批量导出待翻译文本交给 AI 翻译，自动擦字、按气泡排版嵌字、按页并行处理并输出成品 PDF。
+
 # Manga/Image Translator (English Readme)
 Last Updated: 2025/05/10
 ---

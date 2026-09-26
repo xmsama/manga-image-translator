@@ -1,0 +1,6 @@
+# 漫画翻译工具（workflow/）额外依赖，在 manga-image-translator 的 venv 里安装
+PySide6
+pymupdf
+img2pdf
+fonttools
+py7zr

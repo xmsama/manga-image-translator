@@ -1,0 +1,15 @@
+# 运行时数据：本机书目、工程索引、中转文本（含漫画内容），不提交
+gui_books.json
+projects_index.json
+翻译中转/
+*_翻译工程/
+__pycache__/
+*.part
+
+# 字体由 install_fonts.py 下载，不提交字体文件
+fonts/*.ttf
+fonts/*.otf
+fonts/*.ttc
+
+# 漫画文件
+*.pdf

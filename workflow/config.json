@@ -1,0 +1,36 @@
+{
+  "_说明": "导出/导入/一键翻译共用此配置。导出导入时 translator 会被自动替换，只有一键翻译会用到 translator 字段",
+  "_target_lang": "译文语言：CHS 简中 / CHT 繁中 / ENG 英文 / JPN 日文 / KOR 韩文，影响排版方式",
+  "_translator": "一键翻译用的翻译器：离线 m2m100_big / m2m100 / sugoi(仅日译英)；在线 deepseek / chatgpt / gemini 等需在 仓库根目录的 .env 配置 API Key",
+  "translator": {
+    "translator": "m2m100_big",
+    "target_lang": "CHS"
+  },
+  "detector": {
+    "detector": "default",
+    "detection_size": 2048
+  },
+  "ocr": {
+    "ocr": "48px"
+  },
+  "inpainter": {
+    "inpainter": "lama_large",
+    "inpainting_size": 2048
+  },
+  "render": {
+    "direction": "auto",
+    "font_size_offset": 0
+  },
+  "mask_dilation_offset": 20,
+  "_typeset": "renderer: typeset 使用新嵌字器 / default 使用引擎原渲染；font 为 fonts 目录下的字体文件；size_scale 字号倍率；stroke: auto/always/never；direction: auto/h/v",
+  "typeset": {
+    "renderer": "typeset",
+    "font": "源柔黑体-Medium.ttf",
+    "size_scale": 1.0,
+    "min_scale": 0.55,
+    "line_spacing": 1.18,
+    "margin": 0.1,
+    "stroke": "auto",
+    "direction": "auto"
+  }
+}
