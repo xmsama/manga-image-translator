@@ -64,9 +64,39 @@ def _cmap(path):
         return None
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=16)
+def _loadable_path(path):
+    """Windows 上 Pillow 遇到含非 ASCII 字符的字体路径（如 fonts/源柔黑体-Medium.ttf）
+    会把整个字体文件读进内存再交给 FreeType，而且每个字号各一份（中文字体约 14MB×2）。
+    嵌字时字号很多，GPU 进程的内存会随页数一路上涨。
+    复制到纯 ASCII 路径后，FreeType 直接按需读取文件，每个字号只占很少内存。"""
+    try:
+        path.encode('ascii')
+        return path
+    except UnicodeEncodeError:
+        pass
+    import hashlib
+    import shutil
+    import tempfile
+    try:
+        st = os.stat(path)
+        key = hashlib.md5(f'{os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}'.encode('utf-8')).hexdigest()[:16]
+        folder = os.path.join(tempfile.gettempdir(), 'manga_typeset_fonts')
+        dst = os.path.join(folder, key + os.path.splitext(path)[1])
+        dst.encode('ascii')
+        if not os.path.exists(dst):
+            os.makedirs(folder, exist_ok=True)
+            tmp = f'{dst}.{os.getpid()}.part'
+            shutil.copyfile(path, tmp)
+            os.replace(tmp, dst)
+        return dst
+    except (OSError, UnicodeEncodeError):
+        return path     # 临时目录不可用时退回原路径（仍能用，只是占内存）
+
+
+@lru_cache(maxsize=64)
 def _font(path, size):
-    return ImageFont.truetype(path, max(4, int(size)))
+    return ImageFont.truetype(_loadable_path(path), max(4, int(size)))
 
 
 class Fonts:
@@ -222,27 +252,118 @@ def find_bubble(gray, box, tol=26):
     return None, False
 
 
+# 掩码都是整页大小，但有效部分只是一个气泡。以下运算都先裁到包围框再算，
+# 否则文字多的页面（几十个文本框、两两比较）会在整页数组上反复运算，非常慢。
+_RECTS = {}
+
+
+def _rect(m):
+    """掩码的包围框 (x0, y0, x1, y1, 像素数)，x1/y1 不含。同一页内按对象缓存（typeset_page 结束时清空）"""
+    hit = _RECTS.get(id(m))
+    if hit is not None and hit[0] is m:
+        return hit[1]
+    x, y, w, h = cv2.boundingRect(m)
+    r = (x, y, x + w, y + h, int(np.count_nonzero(m[y:y + h, x:x + w])))
+    _RECTS[id(m)] = (m, r)
+    return r
+
+
+def _overlap(a, b):
+    """两个掩码重叠的像素数"""
+    ra, rb = _rect(a), _rect(b)
+    x0, y0, x1, y1 = max(ra[0], rb[0]), max(ra[1], rb[1]), min(ra[2], rb[2]), min(ra[3], rb[3])
+    if x0 >= x1 or y0 >= y1:
+        return 0
+    return int(np.count_nonzero(a[y0:y1, x0:x1] & b[y0:y1, x0:x1]))
+
+
+def same_bubble(a, b):
+    if a is None or b is None:
+        return False
+    return _overlap(a, b) >= 0.5 * min(_rect(a)[4], _rect(b)[4])
+
+
+def _erode(mask, iterations):
+    """只在包围框附近腐蚀（结果与整页腐蚀相同）"""
+    x0, y0, x1, y1, _ = _rect(mask)
+    H, W = mask.shape
+    x0, y0, x1, y1 = max(0, x0 - 1), max(0, y0 - 1), min(W, x1 + 1), min(H, y1 + 1)
+    out = np.zeros_like(mask)
+    # 默认边界（图外视为可用）与整页腐蚀一致：裁剪边外扩的 1 像素本身是 0，照样会从那里向内腐蚀
+    out[y0:y1, x0:x1] = cv2.erode(mask[y0:y1, x0:x1], np.ones((3, 3), np.uint8), iterations=iterations)
+    return out
+
+
+FRAGMENT_CHARS = 3   # 原文（不计标点）不超过这么多字的框视为碎片
+
+
+def _box_gap(a, b):
+    return max(a[0] - b[2], b[0] - a[2], 0) + max(a[1] - b[3], b[1] - a[3], 0)
+
+
+def merge_bubble_fragments(regions, boxes, found):
+    """OCR 有时把气泡里一句话的末尾几个字（如「じゃ」「ね」）识别成单独的框。
+    这种碎片与同一气泡里最近的框合成一段排版，否则碎片的译文会被单独挤到气泡一角。
+    返回 [(区域, 框, 译文, (气泡掩码, 是否封闭))]，区域取较长的那段（决定方向、颜色）"""
+    items = [[r, b, r.translation, f, i] for i, (r, b, f) in enumerate(zip(regions, boxes, found))]
+    count = lambda r: len(re.sub(r'[\W_…‥ー〜～]', '', getattr(r, 'text', '') or ''))
+    changed = True
+    while changed:
+        changed = False
+        for frag in items:
+            if not frag[3][1] or count(frag[0]) > FRAGMENT_CHARS:
+                continue
+            mates = [o for o in items if o is not frag and o[3][1] and same_bubble(o[3][0], frag[3][0])]
+            if not mates:
+                continue
+            other = min(mates, key=lambda o: _box_gap(o[1], frag[1]))
+            first, second = (frag, other) if frag[4] < other[4] else (other, frag)
+            a, b = first[2].rstrip(), second[2].lstrip()
+            sep = ' ' if a[-1:].isascii() and a[-1:].isalnum() and b[:1].isascii() and b[:1].isalnum() else ''
+            main = other if count(other[0]) >= count(frag[0]) else frag
+            box = (min(frag[1][0], other[1][0]), min(frag[1][1], other[1][1]),
+                   max(frag[1][2], other[1][2]), max(frag[1][3], other[1][3]))
+            merged = [main[0], box, a + sep + b, main[3], first[4]]
+            items[items.index(other)] = merged
+            items.remove(frag)
+            changed = True
+            break
+    return [(r, b, t, f) for r, b, t, f, _ in items]
+
+
+def _rect_dist(xs, ys, box, center=False):
+    """各像素到矩形框的距离平方（框内为 0）；center=True 时改为到框中心的距离平方"""
+    x1, y1, x2, y2 = box
+    if center:
+        return (xs - (x1 + x2) / 2) ** 2 + (ys - (y1 + y2) / 2) ** 2
+    dx = np.maximum(np.maximum(x1 - xs, xs - x2), 0)
+    dy = np.maximum(np.maximum(y1 - ys, ys - y2), 0)
+    return dx.astype(np.int64) ** 2 + dy.astype(np.int64) ** 2
+
+
 def split_shared_bubbles(masks, boxes):
     """同一个气泡里有多个文本区域时，按离哪个原文更近来划分气泡"""
     n = len(masks)
     for i in range(n):
         for j in range(i + 1, n):
             a, b = masks[i], masks[j]
-            if a is None or b is None:
+            if not same_bubble(a, b):
                 continue
-            inter = np.count_nonzero(a & b)
-            if inter < 0.5 * min(np.count_nonzero(a), np.count_nonzero(b)):
-                continue
-            ys, xs = np.nonzero(a | b)
-            ca = np.array([(boxes[i][0] + boxes[i][2]) / 2, (boxes[i][1] + boxes[i][3]) / 2])
-            cb = np.array([(boxes[j][0] + boxes[j][2]) / 2, (boxes[j][1] + boxes[j][3]) / 2])
-            da = (xs - ca[0]) ** 2 + (ys - ca[1]) ** 2
-            db = (xs - cb[0]) ** 2 + (ys - cb[1]) ** 2
-            union = a | b
+            ra, rb = _rect(a), _rect(b)
+            x0, y0 = min(ra[0], rb[0]), min(ra[1], rb[1])
+            x1, y1 = max(ra[2], rb[2]), max(ra[3], rb[3])
+            ys, xs = np.nonzero(a[y0:y1, x0:x1] | b[y0:y1, x0:x1])
+            xs, ys = xs + x0, ys + y0
+            # 按到原文框（矩形）的距离划分：原文字所在的地方一定归它自己。
+            # 按中心点距离划分时，斜着相邻的两个框会被一条斜线切开，
+            # 把某个框原文顶部的空间划给另一个框，译文只好往下挪
+            da, db = _rect_dist(xs, ys, boxes[i]), _rect_dist(xs, ys, boxes[j])
+            ca, cb = _rect_dist(xs, ys, boxes[i], True), _rect_dist(xs, ys, boxes[j], True)
+            to_a = (da < db) | ((da == db) & (ca <= cb))   # 两框重叠处按中心距离
             na, nb = np.zeros_like(a), np.zeros_like(b)
-            na[ys[da <= db], xs[da <= db]] = 255
-            nb[ys[da > db], xs[da > db]] = 255
-            masks[i], masks[j] = na & union, nb & union
+            na[ys[to_a], xs[to_a]] = 255
+            nb[ys[~to_a], xs[~to_a]] = 255
+            masks[i], masks[j] = na, nb
     return masks
 
 
@@ -251,13 +372,33 @@ def split_shared_bubbles(masks, boxes):
 class Area:
     """可用区域（气泡内缩后的掩码），提供按行/按列查询可用宽度"""
 
-    def __init__(self, mask):
-        self.mask = mask > 0
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    def __init__(self, mask, anchor=None):
+        """anchor: 希望文字居中的位置（如原文中心）。离边缘太近时向「视觉中心」靠拢。
+        内部只保存包围框（外扩 1 像素）内的部分，对外的坐标仍是整页坐标"""
+        H, W = mask.shape
+        x, y, w, h = cv2.boundingRect(mask)
+        if w == 0 or h == 0:
+            x, y, w, h = 0, 0, W, H
+        x0, y0, x1, y1 = max(0, x - 1), max(0, y - 1), min(W, x + w + 1), min(H, y + h + 1)
+        self.ox, self.oy, self.shape = x0, y0, (H, W)
+        crop = np.ascontiguousarray(mask[y0:y1, x0:x1])
+        self.mask = crop > 0
+        dist = cv2.distanceTransform(crop, cv2.DIST_L2, 5)
         cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
-        self.cx, self.cy = int(cx), int(cy)
+        self.cx, self.cy = int(cx) + x0, int(cy) + y0
+        self.anchored = False       # True：以原文位置为准，不再在气泡里重新居中
+        if anchor is not None:
+            best = dist[cy, cx]
+            for t in (1.0, 0.75, 0.5, 0.25):
+                ax = int(round(self.cx + (anchor[0] - self.cx) * t)) - x0
+                ay = int(round(self.cy + (anchor[1] - self.cy) * t)) - y0
+                if 0 <= ay < dist.shape[0] and 0 <= ax < dist.shape[1] and dist[ay, ax] >= 0.5 * best:
+                    self.cx, self.cy = ax + x0, ay + y0
+                    self.anchored = True
+                    break
         ys, xs = np.nonzero(self.mask)
-        self.bbox = (xs.min(), ys.min(), xs.max(), ys.max()) if len(xs) else (cx, cy, cx, cy)
+        self.bbox = (xs.min() + x0, ys.min() + y0, xs.max() + x0, ys.max() + y0) if len(xs) \
+            else (self.cx, self.cy, self.cx, self.cy)
 
     def _run(self, line, c):
         """一行（或一列）像素里包含位置 c 的连续可用区间"""
@@ -274,27 +415,31 @@ class Area:
     def h_span(self, y0, y1):
         """水平条带 [y0,y1] 内，包含中心列的可用横向区间（各行取交集）"""
         y0, y1 = int(np.floor(y0)), int(np.ceil(y1))
-        if y0 < 0 or y1 >= self.mask.shape[0]:
+        if y0 < 0 or y1 >= self.shape[0]:
             return None
         lo, hi = -1, 10 ** 9
         for y in range(y0, y1 + 1, max(1, (y1 - y0) // 6)):
-            run = self._run(self.mask[y], self.cx)
+            if not 0 <= y - self.oy < self.mask.shape[0]:
+                return None                 # 包围框外的行没有可用像素
+            run = self._run(self.mask[y - self.oy], self.cx - self.ox)
             if run is None:
                 return None
             lo, hi = max(lo, run[0]), min(hi, run[1])
-        return (lo, hi) if hi > lo else None
+        return (lo + self.ox, hi + self.ox) if hi > lo else None
 
     def v_span(self, x0, x1):
         x0, x1 = int(np.floor(x0)), int(np.ceil(x1))
-        if x0 < 0 or x1 >= self.mask.shape[1]:
+        if x0 < 0 or x1 >= self.shape[1]:
             return None
         lo, hi = -1, 10 ** 9
         for x in range(x0, x1 + 1, max(1, (x1 - x0) // 6)):
-            run = self._run(self.mask[:, x], self.cy)
+            if not 0 <= x - self.ox < self.mask.shape[1]:
+                return None
+            run = self._run(self.mask[:, x - self.ox], self.cy - self.oy)
             if run is None:
                 return None
             lo, hi = max(lo, run[0]), min(hi, run[1])
-        return (lo, hi) if hi > lo else None
+        return (lo + self.oy, hi + self.oy) if hi > lo else None
 
 
 def layout_horizontal(units, fonts, size, area, spacing):
@@ -332,24 +477,57 @@ def layout_horizontal(units, fonts, size, area, spacing):
                 best, hi = cand, mid
             else:
                 lo = mid
+        # 各行共用同一条居中轴，气泡边缘弯曲处放不下时才平移，避免斜气泡里行行错开
         placed = []
         for i, text in enumerate(best):
             l, r = spans[i]
             w = measure(text)
-            placed.append((text, (l + r) / 2 - w / 2, top + i * lh))
+            placed.append((text, min(max(area.cx - w / 2, l), r - w), top + i * lh))
         # 实际行数少于 n 时重新垂直居中
         if len(best) < n:
             k = len(best)
             new_top = area.cy - ((k - 1) * lh + size) / 2
             placed = [(t, x, new_top + i * lh) for i, (t, x, _) in enumerate(placed)]
+        if not area.anchored:
+            placed = _recenter_horizontal(placed, measure, size, lh, area) or placed
         return placed
     return None
+
+
+def _recenter_horizontal(placed, measure, size, lh, area):
+    """横排整块在气泡里重新居中：上下按文字所占宽度范围内的留白相等，左右按文字所占高度范围内居中。
+    （内切圆圆心在不对称的气泡里会偏向一侧）放不下返回 None"""
+    widths = [measure(t) for t, _, _ in placed]
+    xl = min(x for _, x, _ in placed)
+    xr = max(x + w for (_, x, _), w in zip(placed, widths))
+    col = area.v_span(xl, xr)
+    if not col:
+        return None
+    block_h = (len(placed) - 1) * lh + size
+    top = (col[0] + col[1]) / 2 - block_h / 2
+    row = area.h_span(top, top + block_h)
+    if not row:
+        return None
+    axis = (row[0] + row[1]) / 2
+    out = []
+    for (text, _, _), w, i in zip(placed, widths, range(len(placed))):
+        span = area.h_span(top + i * lh, top + i * lh + size)
+        if not span or span[1] - span[0] < w - 0.5:
+            return None
+        out.append((text, min(max(axis - w / 2, span[0]), span[1] - w), top + i * lh))
+    return out
 
 
 def vertical_chars(line):
     """竖排：拆成逐字，标点换成竖排字形；两位以内数字横放（纵中横）"""
     out, i = [], 0
     while i < len(line):
+        # 「!!」「!?」等两个连续感叹/问号并排放进一格（纵中横），与日漫原版一致
+        m = re.match(r'[!?！？]{2}', line[i:])
+        if m:
+            out.append(m.group().translate(str.maketrans('！？', '!?')))
+            i += 2
+            continue
         m = re.match(r'[0-9]{1,2}(?![0-9])', line[i:])
         if m and (i == 0 or not line[i - 1].isdigit()):
             out.append(m.group())
@@ -361,18 +539,42 @@ def vertical_chars(line):
 
 
 def layout_vertical(units, fonts, size, area, spacing):
+    """竖排：所有列共用同一条顶线（与日漫原版一致），整块在气泡里垂直居中。
+
+    顶线不能高于任何一列处的气泡上沿，因此每列的容量按「该列下沿 - 共用顶线」计算，
+    圆形气泡两侧的列自然排得短一些，而不是把列往下挪造成参差。
+    """
     adv = size * 1.02
     col_w = size * spacing * 1.08
+    slack = size * 0.3      # 顶线允许略微伸进内边距（可用区域已按气泡短边内缩过）
     measure = lambda s: len(vertical_chars(s.replace(' ', ''))) * adv
     total_h = measure(''.join(units))
     max_cols = max(1, int((area.bbox[2] - area.bbox[0]) / col_w) + 1)
-    for n in range(1, max_cols + 1):
-        block_w = (n - 1) * col_w + size
-        right = area.cx + block_w / 2
+
+    def spans_at(right, n):
         spans = [area.v_span(right - i * col_w - size, right - i * col_w) for i in range(n)]
-        if any(s is None for s in spans):
+        return None if any(s is None for s in spans) else spans
+
+    def place(cols, right, spans):
+        heights = [measure(text) for text in cols]
+        lo = max(s[0] for s in spans) - slack           # 顶线下限：每列的气泡上沿
+        hi = min(s[1] - h for s, h in zip(spans, heights))  # 顶线上限：每列都不超出气泡下沿
+        if lo > hi + 0.5:
+            return None
+        if area.anchored:
+            ideal = area.cy - max(heights) / 2
+        else:   # 在这几列所在的范围内上下留白相等（内切圆圆心在上宽下窄的气泡里会偏上）
+            ideal = (max(s[0] for s in spans) + hi) / 2
+        top = min(max(ideal, lo), hi)
+        return [(text.replace(' ', ''), right - i * col_w - size, top) for i, text in enumerate(cols)]
+
+    for n in range(1, max_cols + 1):
+        right = area.cx + ((n - 1) * col_w + size) / 2
+        spans = spans_at(right, n)
+        if spans is None:
             continue
-        caps = [s[1] - s[0] for s in spans]
+        top_line = max(s[0] for s in spans) - slack
+        caps = [s[1] - top_line for s in spans]
         if sum(caps) < total_h * 0.98:
             continue
         cols = greedy_lines(units, caps, measure)
@@ -386,13 +588,21 @@ def layout_vertical(units, fonts, size, area, spacing):
                 best, hi = cand, mid
             else:
                 lo = mid
+        # 实际列数少于 n 时按实际列数重新水平居中；居中后放不下就保持原位置
         k = len(best)
-        right = area.cx + ((k - 1) * col_w + size) / 2
-        placed = []
-        for i, text in enumerate(best):
-            t, b = spans[i]
-            h = measure(text)
-            placed.append((text.replace(' ', ''), right - i * col_w - size, (t + b) / 2 - h / 2))
+        block_w = (k - 1) * col_w + size
+        right_k = area.cx + block_w / 2
+        spans_k = spans_at(right_k, k)
+        placed = place(best, right_k, spans_k) if spans_k else None
+        placed = placed or place(best, right, spans[:k])
+        if placed and not area.anchored:
+            # 再在文字所占的高度范围内左右居中：内切圆圆心不一定在气泡左右正中
+            top = placed[0][2]
+            row = area.h_span(top, top + max(measure(t) for t, _, _ in placed))
+            if row:
+                right_c = (row[0] + row[1]) / 2 + block_w / 2
+                spans_c = spans_at(right_c, k) if abs(right_c - (placed[0][1] + size)) > 1 else None
+                placed = (place(best, right_c, spans_c) if spans_c else None) or placed
         return placed
     return None
 
@@ -459,34 +669,44 @@ def clean_bubbles(img, found, keep_boxes, base, logger=None):
     for mask, enclosed in found:
         if mask is None or not enclosed:
             continue
-        if any(np.count_nonzero(mask & d) > 0.8 * np.count_nonzero(mask) for d in done):
+        if any(_overlap(mask, d) > 0.8 * _rect(mask)[4] for d in done):
             continue                                  # 同一个气泡已处理过
         done.append(mask)
-        inner = cv2.erode(mask, k3, iterations=2)
-        if any(inner[max(0, y1):y2 + 1, max(0, x1):x2 + 1].any() for x1, y1, x2, y2 in keep_boxes):
+        # 只在气泡包围框（外扩几像素，留给膨胀和模糊）内运算，结果与整页运算相同
+        rx0, ry0, rx1, ry1, _ = _rect(mask)
+        ox, oy = max(0, rx0 - 6), max(0, ry0 - 6)
+        ex, ey = min(W, rx1 + 6), min(H, ry1 + 6)
+        m = mask[oy:ey, ox:ex]
+        sub = img[oy:ey, ox:ex]
+        inner = cv2.erode(m, k3, iterations=2)
+        hit = False
+        for x1, y1, x2, y2 in keep_boxes:
+            ix0, iy0, ix1, iy1 = max(x1, ox, 0), max(y1, oy, 0), min(x2 + 1, ex), min(y2 + 1, ey)
+            if ix0 < ix1 and iy0 < iy1 and inner[iy0 - oy:iy1 - oy, ix0 - ox:ix1 - ox].any():
+                hit = True
+                break
+        if hit:
             continue
         sel = inner > 0
-        px = img[sel].astype(np.int16)
+        px = sub[sel].astype(np.int16)
         if len(px) < 200:
             continue
         bg = np.median(px, axis=0)
-        diff = np.zeros((H, W), np.int16)
+        diff = np.zeros(sel.shape, np.int16)
         diff[sel] = np.abs(px - bg).max(axis=1)
         if (diff[sel] < 30).mean() < 0.9:
             continue                                  # 底色不均匀
         ink = ((diff > 28) & sel).astype(np.uint8)
         n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-        erase = np.zeros((H, W), np.uint8)
-        for i in range(1, n):
-            x, y, w, h, a = stats[i]
-            if max(w, h) <= limit:
-                erase[labels == i] = 255
-                total += 1
-        if not erase.any():
+        small = np.zeros(n, bool)
+        small[1:] = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT]) <= limit
+        if not small.any():
             continue
-        erase = cv2.dilate(erase, k3, iterations=2) & mask
+        total += int(small.sum())
+        erase = np.where(small[labels], 255, 0).astype(np.uint8)
+        erase = cv2.dilate(erase, k3, iterations=2) & m
         soft = cv2.GaussianBlur(erase.astype(np.float32) / 255, (5, 5), 0)[..., None]
-        img[:] = (img * (1 - soft) + bg.reshape(1, 1, 3) * soft).astype(np.uint8)
+        sub[:] = (sub * (1 - soft) + bg.reshape(1, 1, 3) * soft).astype(np.uint8)
     if total and logger:
         logger.info(f'清理气泡内残留：{total} 处（注音 / 残字 / 杂点）')
     return img
@@ -494,7 +714,7 @@ def clean_bubbles(img, found, keep_boxes, base, logger=None):
 
 # ================================================================ 入口
 
-SWITCH_GAIN = 1.15   # 另一方向的字号至少大 15% 才换方向，避免同页横竖来回跳
+SWITCH_GAIN = 1.3    # 另一方向的字号至少大 30% 才换方向，避免同页横竖来回跳（竖排顶部对齐在圆气泡里本就略吃亏）
 
 
 def fit_size(layout, units, fonts, base, inner, full, st):
@@ -545,6 +765,13 @@ def _is_vertical_source(region):
 
 def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS', logger=None, keep_boxes=()):
     """img: 擦字后的 RGB 图（numpy）。返回嵌字后的 RGB 图"""
+    try:
+        return _typeset_page(img, regions, settings, base_size, target_lang, logger, keep_boxes)
+    finally:
+        _RECTS.clear()          # 释放本页掩码的引用
+
+
+def _typeset_page(img, regions, settings, base_size, target_lang, logger, keep_boxes):
     st = dict(DEFAULTS)
     st.update({k: v for k, v in (settings or {}).items() if v is not None})
     regions = [r for r in regions if (getattr(r, 'translation', '') or '').strip()]
@@ -564,21 +791,30 @@ def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS',
     found = [find_bubble(gray, b) for b in boxes]
     if st.get('clean', True):
         img = clean_bubbles(np.ascontiguousarray(img).copy(), found, list(keep_boxes), base, logger)
+    items = merge_bubble_fragments(regions, boxes, found)
+    if logger and len(items) < len(regions):
+        logger.info(f'合并气泡内的碎片文本框：{len(regions)} → {len(items)} 段')
+    boxes = [b for _, b, _, _ in items]
+    found = [f for _, _, _, f in items]
     masks = split_shared_bubbles([m for m, _ in found], boxes)
+    # 与别的文本框共用一个气泡时，各自以原文位置为中心，而不是切开后那一半的几何中心
+    shared = [any(j != i and same_bubble(found[i][0], found[j][0]) for j in range(len(found)))
+              for i in range(len(found))]
 
     pil = Image.fromarray(img)
     draw = ImageDraw.Draw(pil)
-    for r, box, mask, (_, enclosed) in zip(regions, boxes, masks, found):
+    for (r, box, text, (_, enclosed)), mask, is_shared in zip(items, masks, shared):
         x1, y1, x2, y2 = box
         bw, bh = x2 - x1, y2 - y1
+        anchor = ((x1 + x2) / 2, (y1 + y2) / 2) if is_shared else None
         if mask is not None and enclosed:
-            ys, xs = np.nonzero(mask)
-            short = min(xs.max() - xs.min(), ys.max() - ys.min())
+            mx0, my0, mx1, my1, _ = _rect(mask)
+            short = min(mx1 - mx0, my1 - my0) - 1
             m = max(2, int(short * st['margin']))
-            area_mask = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=max(1, m // 1))
-            if np.count_nonzero(area_mask) < 50:
+            area_mask = _erode(mask, max(1, m // 1))
+            if _rect(area_mask)[4] < 50:
                 area_mask = mask
-            bubble_gray = float(np.median(gray[mask > 0]))
+            bubble_gray = float(np.median(gray[my0:my1, mx0:mx1][mask[my0:my1, mx0:mx1] > 0]))
         else:
             # 没有封闭气泡：在原文区域基础上略微放宽
             area_mask = np.zeros_like(gray, dtype=np.uint8)
@@ -587,9 +823,9 @@ def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS',
                           (min(W - 1, x2 + ex), min(H - 1, y2 + ey)), 255, -1)
             bubble_gray = None
             enclosed = False
-        area = Area(area_mask)
+        area = Area(area_mask, anchor)
 
-        units = tokenize(r.translation)
+        units = tokenize(text)
         fg, bg = _colors(r, bubble_gray)
         stroke_mode = st['stroke']
         use_stroke = stroke_mode == 'always' or (stroke_mode == 'auto' and not enclosed)
@@ -598,15 +834,15 @@ def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS',
         inner = area
         sw_ref = max(1, round(base * 0.12)) if use_stroke else 0
         if sw_ref:
-            eroded = cv2.erode(area_mask, np.ones((3, 3), np.uint8), iterations=sw_ref)
-            if np.count_nonzero(eroded) >= 50:
-                inner = Area(eroded)
-        full = Area(mask) if (enclosed and mask is not None) else None
+            eroded = _erode(area_mask, sw_ref)
+            if _rect(eroded)[4] >= 50:
+                inner = Area(eroded, anchor)
+        full = Area(mask, anchor) if (enclosed and mask is not None) else None
 
         # 候选方向：跟随原文时，先试原文方向；放不满基准字号才试另一方向
         direction = st['direction']
         src_vertical = _is_vertical_source(r)
-        can_vertical = cjk_target and not re.search(r'[A-Za-z]{4,}', r.translation)
+        can_vertical = cjk_target and not re.search(r'[A-Za-z]{4,}', text)
         if direction == 'h' or not can_vertical:
             candidates = [False]
         elif direction == 'v':
@@ -625,7 +861,7 @@ def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS',
         for vert, sz, pl in tried[1:]:
             if pl is not None and (placed is None or sz >= size * SWITCH_GAIN):
                 if logger:
-                    logger.info(f'换成{"竖排" if vert else "横排"}更合适（字号 {size:.0f}→{sz:.0f}）：{r.translation[:16]}')
+                    logger.info(f'换成{"竖排" if vert else "横排"}更合适（字号 {size:.0f}→{sz:.0f}）：{text[:16]}')
                 vertical, size, placed = vert, sz, pl
 
         if placed is None:
@@ -646,10 +882,10 @@ def typeset_page(img, regions, settings=None, base_size=None, target_lang='CHS',
                     vertical = vert
                     break
             if placed is not None and logger:
-                logger.warning(f'气泡内放不下，已在原文区域内缩小排版：{r.translation[:20]}')
+                logger.warning(f'气泡内放不下，已在原文区域内缩小排版：{text[:20]}')
         if placed is None:
             if logger:
-                logger.warning(f'排版失败：{r.translation[:20]} | 封闭气泡={enclosed} 原文框={box} '
+                logger.warning(f'排版失败：{text[:20]} | 封闭气泡={enclosed} 原文框={box} '
                                f'基准字号={base:.1f}')
             continue
         size = int(round(size))

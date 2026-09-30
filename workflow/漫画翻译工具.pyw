@@ -21,7 +21,8 @@ from itertools import count
 from PySide6.QtCore import QFile, QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QGuiApplication
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QLineEdit, QHBoxLayout, QHeaderView, QLabel,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QSpinBox,
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -30,6 +31,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import mit_workflow as wf  # noqa: E402  只用到其中不加载引擎的工具函数
 import typeset  # noqa: E402
+import credits  # noqa: E402
 
 PYTHON = os.path.join(wf.REPO, 'venv', 'Scripts', 'python.exe')
 if not os.path.exists(PYTHON):  # 没用 venv 时，用启动本程序的解释器（pythonw 换成 python，便于读取输出）
@@ -320,6 +322,10 @@ class MainWindow(QMainWindow):
             self.ts_dir.addItem(label, val)
         self.ts_dir.setCurrentIndex(max(0, self.ts_dir.findData(ts.get('direction', 'auto'))))
         row.addWidget(self.ts_dir)
+        cr = QPushButton('汉化组设置…')
+        cr.setToolTip('在 PDF 首页/末页插入汉化组信息页、给页面打水印')
+        cr.clicked.connect(self.credits_dialog)
+        row.addWidget(cr)
         prev = QPushButton('预览排版')
         prev.setToolTip('用当前设置只生成选中漫画的一页，确认效果后再整本生成')
         prev.clicked.connect(self.preview)
@@ -358,7 +364,8 @@ class MainWindow(QMainWindow):
                               'input': os.path.join(project['input_dir'], rel), 'output': out,
                               'src': project['pages'][rel],
                               'trans': {str(k): v for k, v in trans.get(rel, {}).items()},
-                              'base_size': wf.book_base_size(project)})
+                              'base_size': wf.book_base_size(project),
+                              'cache': wf.cache_path_for(b.project, rel)})
         self.statusBar().showMessage(f'正在生成预览：{b.name} / {rel}', 8000)
         self.adjust_pool()
 
@@ -370,7 +377,7 @@ class MainWindow(QMainWindow):
                            ('打开待翻译 txt', self.open_export_txt), ('加载译文', self.load_translations),
                            ('从剪贴板导入译文', self.import_clipboard),
                            ('选择译文文件导入', self.import_file), ('重新生成', self.regenerate),
-                           ('预览排版', self.preview), (None, None), ('打开 PDF', self.open_pdf), ('导出成品 PDF', self.export_pdfs),
+                           ('预览排版', self.preview), (None, None), ('打开 PDF', self.open_pdf), ('重新合成 PDF', self.rebuild_pdfs), ('导出成品 PDF', self.export_pdfs),
                            ('打开工程目录', self.open_project),
                            (None, None), ('取消任务', self.cancel_selected), ('清理工程…', self.cleanup_selected),
                            ('从列表移除', self.remove_selected)]:
@@ -538,6 +545,11 @@ class MainWindow(QMainWindow):
         env = QProcessEnvironment.systemEnvironment()
         for k, v in (('PYTHONUTF8', '1'), ('PYTHONIOENCODING', 'utf-8'), ('PYTHONUNBUFFERED', '1')):
             env.insert(k, v)
+        # PyTorch / OpenCV / numpy 默认各开「逻辑核数」个线程，几个 GPU 进程同时跑会互相抢核，
+        # CPU 占用飙高反而更慢（实测单进程限 4 线程：CPU 消耗少 28%，速度略快）
+        threads = str(max(2, min(4, (os.cpu_count() or 8) // max(1, self.workers_spin.value()))))
+        for k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS', 'WORKER_THREADS'):
+            env.insert(k, threads)
         proc.setProcessEnvironment(env)
         proc.setProcessChannelMode(QProcess.MergedChannels)
         proc.setWorkingDirectory(ROOT)
@@ -608,6 +620,12 @@ class MainWindow(QMainWindow):
                 w.ready = True
                 self.sys_log(f'GPU 进程 #{w.id} 就绪')
                 self.dispatch()
+            elif line.startswith(wf.RECYCLE_LINE):
+                # 该进程做完当前页就退出（定期换新进程释放泄漏的内存）：不再派任务，提前启动接替的进程
+                w.retiring = True
+                info = line[len(wf.RECYCLE_LINE):].strip()
+                self.sys_log(f'GPU 进程 #{w.id}（已处理 {info}）做完当前页后换新进程，释放内存')
+                self.adjust_pool()
             elif line.startswith(wf.RESULT_PREFIX):
                 job, w.job = w.job, None
                 if job:
@@ -689,6 +707,165 @@ class MainWindow(QMainWindow):
         if book.done >= book.total:
             self.finish_book(book)
 
+    # ------------------------------------------------------------ 汉化组信息
+    def rebuild_pdfs(self, books=None):
+        """用已生成的页面图片重新合成 PDF（应用最新的汉化组设置），不需要 GPU"""
+        books = [b for b in (books or self.selected_books() or self.books)
+                 if not b.job and wf.list_images(os.path.join(b.project, wf.OUTPUT_DIR))]
+        if not books:
+            QMessageBox.information(self, '重新合成 PDF',
+                                    '没有可以合成的漫画（需要已生成过页面；清理过中间文件的要先「重新生成」）')
+            return
+        names = [b.name for b in books]
+
+        def work():
+            for b in books:
+                wf.build_pdf(os.path.join(b.project, wf.OUTPUT_DIR), b.pdf, b.name)
+
+        def done(_, err):
+            if err:
+                QMessageBox.warning(self, '合成失败', str(err))
+            else:
+                self.statusBar().showMessage(f'已重新合成 {len(names)} 本 PDF：' + '、'.join(names[:5]), 8000)
+                if self.auto_export.isChecked():
+                    self.export_pdfs(books, quiet=True)
+            self.refresh()
+
+        self.statusBar().showMessage(f'正在重新合成 {len(names)} 本 PDF…', 8000)
+        self.run_bg(work, done)
+
+    def credits_dialog(self):
+        cfg = wf.read_config()
+        st = credits.settings(cfg)
+        wm = st['watermark']
+        dlg = QDialog(self)
+        dlg.setWindowTitle('汉化组设置')
+        dlg.resize(620, 560)
+        v = QVBoxLayout(dlg)
+
+        def combo(items, cur):
+            c = QComboBox()
+            for label, val in items:
+                c.addItem(label, val)
+            c.setCurrentIndex(max(0, c.findData(cur)))
+            return c
+
+        def path_row(value, title, filt):
+            edit = QLineEdit(value)
+            btn = QPushButton('选择…')
+            btn.clicked.connect(lambda: (lambda p: edit.setText(p) if p else None)(
+                QFileDialog.getOpenFileName(dlg, title, '', filt)[0]))
+            h = QHBoxLayout()
+            h.addWidget(edit, 1)
+            h.addWidget(btn)
+            return edit, h
+
+        img_filter = '图片 (*.png *.jpg *.jpeg *.webp *.bmp)'
+        g1 = QGroupBox('汉化组信息页')
+        f1 = QFormLayout(g1)
+        page_pos = combo([('不插入', 'none'), ('插在首页', 'first'), ('插在末页', 'last'), ('首页和末页', 'both')],
+                         st['page_position'])
+        f1.addRow('位置：', page_pos)
+        page_img, row = path_row(st['page_image'], '选择信息页图片', img_filter)
+        f1.addRow('自备图片：', row)
+        f1.addRow('', QLabel('有图片就直接用图片（自动缩放到漫画页宽）；没有图片按下面文字自动生成'))
+        group = QLineEdit(st['group'])
+        group.setPlaceholderText('汉化组名称')
+        f1.addRow('组名：', group)
+        lines = QPlainTextEdit(st['lines'])
+        lines.setPlaceholderText('每行一条，例如：\n翻译：xxx\n嵌字：xxx\n仅供学习交流，请支持正版')
+        lines.setFixedHeight(90)
+        f1.addRow('信息：', lines)
+        v.addWidget(g1)
+
+        g2 = QGroupBox('水印')
+        f2 = QFormLayout(g2)
+        mode = combo([('不加水印', 'none'), ('文字水印', 'text'), ('图片水印（logo）', 'image')], wm['mode'])
+        f2.addRow('类型：', mode)
+        wtext = QLineEdit(wm['text'])
+        wtext.setPlaceholderText('例如：某某汉化组')
+        f2.addRow('文字：', wtext)
+        wimg, row = path_row(wm['image'], '选择水印图片', img_filter)
+        f2.addRow('图片：', row)
+        pages = combo([('全部页', 'all'), ('仅首页', 'first'), ('仅末页', 'last'), ('首页和末页', 'first_last')],
+                      wm['pages'])
+        f2.addRow('打在：', pages)
+        pos = combo([('右下角', 'br'), ('左下角', 'bl'), ('右上角', 'tr'), ('左上角', 'tl'), ('居中', 'center')],
+                    wm['position'])
+        f2.addRow('位置：', pos)
+        opacity = QDoubleSpinBox()
+        opacity.setRange(0.05, 1.0)
+        opacity.setSingleStep(0.05)
+        opacity.setValue(float(wm['opacity']))
+        f2.addRow('不透明度：', opacity)
+        size = QDoubleSpinBox()
+        size.setRange(0.02, 0.8)
+        size.setSingleStep(0.01)
+        size.setValue(float(wm['size']))
+        size.setToolTip('图片水印：宽度占页宽的比例；文字水印：数值越大字越大')
+        f2.addRow('大小：', size)
+        v.addWidget(g2)
+
+        def current():
+            return {'page_position': page_pos.currentData(), 'page_image': page_img.text().strip(),
+                    'group': group.text().strip(), 'lines': lines.toPlainText().strip(),
+                    'watermark': {'mode': mode.currentData(), 'text': wtext.text().strip(),
+                                  'image': wimg.text().strip(), 'pages': pages.currentData(),
+                                  'position': pos.currentData(), 'opacity': round(opacity.value(), 2),
+                                  'size': round(size.value(), 3)}}
+
+        def preview():
+            s = credits.settings({'credits': current()})
+            sample = None
+            sel = self.selected_books()
+            for b in sel[:1]:
+                for d in (os.path.join(b.project, wf.OUTPUT_DIR),):
+                    imgs = wf.list_images(d) if os.path.isdir(d) else []
+                    if imgs:
+                        sample = os.path.join(d, imgs[0])
+            out_dir = os.path.join(wf.ROOT, '_预览')
+            os.makedirs(out_dir, exist_ok=True)
+            from PIL import Image
+            page = Image.open(sample) if sample else Image.new('RGB', (1184, 1682), (235, 235, 235))
+            shown = []
+            if s['watermark']['mode'] != 'none':
+                p = os.path.join(out_dir, '水印预览.jpg')
+                credits.watermark(page, s['watermark']).save(p, quality=92)
+                shown.append(p)
+            if s['page_position'] != 'none':
+                p = os.path.join(out_dir, '信息页预览.png')
+                credits.make_credit_page(page.size, s).save(p)
+                shown.append(p)
+            if not shown:
+                QMessageBox.information(dlg, '预览', '信息页和水印都没有启用')
+            for p in shown:
+                open_path(p)
+
+        tip = QLabel('信息页和水印只加在 PDF 里，不改动生成好的页面图片。'
+                     '保存后，已完成的漫画用右键「重新合成 PDF」即可应用（几秒，不需要重新生成）。')
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Save).setText('保存')
+        bb.button(QDialogButtonBox.Cancel).setText('取消')
+        pv = bb.addButton('预览', QDialogButtonBox.ActionRole)
+        pv.setToolTip('选中列表里一本已生成的漫画时，用它的第一页预览；否则用空白页')
+        pv.clicked.connect(preview)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        cfg = wf.read_config()
+        cfg['credits'] = current()
+        with open(wf.CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        done = [b for b in self.books if not b.job and os.path.exists(b.pdf)]
+        if done and QMessageBox.question(self, '汉化组设置已保存',
+                                         f'之后合成的 PDF 都会使用新设置。\n\n'
+                                         f'要现在把已完成的 {len(done)} 本重新合成 PDF 吗？') == QMessageBox.Yes:
+            self.rebuild_pdfs(done)
+
     def finish_book(self, book):
         book.stage = '收尾中'
         if book.job == '导出':
@@ -761,7 +938,8 @@ class MainWindow(QMainWindow):
             book.ctx['input_dir'] = input_dir
             book.add_log(f'共 {len(images)} 页，分发到 GPU 进程并行识别')
             self.enqueue_pages(book, [{'id': next(self.job_ids), 'mode': 'export', 'book': book, 'rel': rel,
-                                       'input': os.path.join(input_dir, rel)} for rel in images])
+                                       'input': os.path.join(input_dir, rel),
+                                       'cache': wf.cache_path_for(book.project, rel)} for rel in images])
 
         self.run_bg(prepare, ready)
 
@@ -786,7 +964,7 @@ class MainWindow(QMainWindow):
         jobs = [{'id': next(self.job_ids), 'mode': 'import', 'book': book, 'rel': rel,
                  'input': os.path.join(input_dir, rel), 'output': os.path.join(out_dir, rel),
                  'src': src, 'trans': {str(k): v for k, v in trans.get(rel, {}).items()},
-                 'base_size': base}
+                 'base_size': base, 'cache': wf.cache_path_for(book.project, rel)}
                 for rel, src in pages.items()]
         book.add_log(f'共 {len(jobs)} 页，分发到 GPU 进程并行生成')
         self.enqueue_pages(book, jobs)
@@ -811,8 +989,8 @@ class MainWindow(QMainWindow):
         self.start_import(book, text)
 
     def load_translations(self):
-        """扫描中转目录/译文，把新放进来的译文逐本加载生成；不在列表里的漫画自动加入"""
-        started, problems = [], []
+        """扫描中转目录/译文，列出新放进来的译文，勾选后逐本加载生成"""
+        found, problems = [], []
         for path, owner in wf.scan_translations():
             name = os.path.basename(path)
             if not owner:
@@ -829,17 +1007,76 @@ class MainWindow(QMainWindow):
             if not re.search(r'^\s*[<＜]\d+[>＞]', text, re.M):
                 problems.append(f'{name}：没有 <编号> 格式的译文')
                 continue
+            found.append((book, path, text))
+        _, done = wf.transfer_dirs()
+        if not found:
+            if problems:
+                QMessageBox.warning(self, '译文未加载', '\n'.join(problems))
+            else:
+                QMessageBox.information(self, '加载译文', f'「{done}」里没有新的译文。\n'
+                                        '让 AI 把「待翻译」文件夹里的 txt 翻译后，以同名文件写入「译文」文件夹，再点「加载译文」。')
+            return
+        picked = self.pick_translations(found, problems)
+        started = []
+        for book, _, text in picked:
             self.start_import(book, text, save=False)
             if book.job:
                 started.append(book.name)
-        _, done = wf.transfer_dirs()
         self.statusBar().showMessage(
-            f'开始加载 {len(started)} 本：' + '、'.join(started) if started else '没有发现新的译文', 8000)
+            f'开始加载 {len(started)} 本：' + '、'.join(started) if started else '没有加载任何译文', 8000)
+
+    def pick_translations(self, found, problems):
+        """列出发现的新译文，勾选要生成的；取消返回空列表"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('加载译文')
+        dlg.resize(900, 460)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(f'发现 {len(found)} 份新译文，勾选这次要生成的：'))
+        table = QTableWidget(len(found), 3)
+        table.setHorizontalHeaderLabels(['漫画', '译文文件', '修改时间'])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        h = table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        for r, (book, path, _) in enumerate(found):
+            name = QTableWidgetItem(book.name)
+            name.setFlags(name.flags() | Qt.ItemIsUserCheckable)
+            name.setCheckState(Qt.Checked)
+            table.setItem(r, 0, name)
+            table.setItem(r, 1, QTableWidgetItem(os.path.basename(path)))
+            table.setItem(r, 2, QTableWidgetItem(time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(path)))))
+        # 点整行任意位置都能切换勾选
+        table.cellClicked.connect(lambda r, c: c and table.item(r, 0).setCheckState(
+            Qt.Unchecked if table.item(r, 0).checkState() == Qt.Checked else Qt.Checked))
+        v.addWidget(table)
         if problems:
-            QMessageBox.warning(self, '部分译文未加载', '\n'.join(problems))
-        elif not started:
-            QMessageBox.information(self, '加载译文', f'「{done}」里没有新的译文。\n'
-                                    '让 AI 把「待翻译」文件夹里的 txt 翻译后，以同名文件写入「译文」文件夹，再点「加载译文」。')
+            warn = QLabel('以下译文无法加载：\n' + '\n'.join(problems))
+            warn.setWordWrap(True)
+            warn.setStyleSheet('color: #c0392b')
+            v.addWidget(warn)
+
+        def check_all(state):
+            for r in range(table.rowCount()):
+                table.item(r, 0).setCheckState(state)
+
+        row = QHBoxLayout()
+        for text, slot in (('全选', lambda: check_all(Qt.Checked)), ('全不选', lambda: check_all(Qt.Unchecked))):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        row.addStretch()
+        v.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText('开始生成')
+        bb.button(QDialogButtonBox.Cancel).setText('取消')
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return []
+        return [found[r] for r in range(table.rowCount()) if table.item(r, 0).checkState() == Qt.Checked]
 
     def open_transfer(self):
         todo, _ = wf.ensure_transfer_dirs()
@@ -933,7 +1170,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         full += sorted(p for p in txts if os.path.isfile(p))
-        known = {wf.PROJECT_FILE, wf.PAGES_DIR, wf.OUTPUT_DIR, '_预览', wf.TRANS_FILE, wf.EXPORT_FILE,
+        known = {wf.PROJECT_FILE, wf.PAGES_DIR, wf.OUTPUT_DIR, '_预览', wf.TRANS_FILE, wf.EXPORT_FILE, wf.CACHE_DIR,
                  os.path.basename(b.pdf), f'{wf.project_name(b.project)}_译文.txt',
                  f'{wf.project_name(b.project)}_待翻译.txt'}
         extra = sorted(f for f in os.listdir(b.project) if f not in known) if os.path.isdir(b.project) else []
